@@ -9,8 +9,8 @@ import socket
 import base64
 import logging
 
-logger = logging.getLogger('jobson relay')
-logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger('Hashi Relay')
+#logging.basicConfig(level=logging.INFO)
 
 def websafe_to_base64(s):
     s = s.replace('-', '+')
@@ -31,74 +31,110 @@ def base64_to_websafe(s):
     s = s.replace('/', '_')
     return s.replace('=', '')
 
+
 class RelayAgent(object):
+    ERROR = -1
+    CREATED = 0
+    CONNECTED = 1
+    CLOSED = 2
 
-    def __init__(self):
-        self._clients = {}
+    def __init__(self, sid, host, port):
+        self.sid = sid
+        self.host = host
+        self.port = port
+        self.reset()
 
-    def new_client(self, session_id, host, port):
+    def set_close_callback(self, callback):
+        self.close_callback = callback
+
+    def reset(self):
+        # init
+        self.status = RelayAgent.CREATED
+        self.read_callback = None
+        self.close_callback = None
+        self.stream = None
+        self.buf_read = ''
+        self.buf_write = ''
+
+    def connect(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
-        stream = tornado.iostream.IOStream(s)
-        client = {'stream': stream, 'read_callback': None, 'connected': False, 
-            'write_buffer': '', 'read_buffer': ''}
-        self._clients[session_id] = client
-        stream.connect((host, port), functools.partial(self._connected, session_id=session_id, stream=stream))
+        self.stream = tornado.iostream.IOStream(s)
+        self.stream.connect((self.host, self.port), self._connected)
 
-    def _connected(self, session_id, stream):
-        client = self._clients[session_id]
-        stream.set_close_callback(functools.partial(self._closed, session_id=session_id))
-        stream.read_until_close(self._read_final_callback, functools.partial(self._streaming_read, session_id=session_id))
-        client['connected'] = True
-        if len(client['write_buffer']) > 0:
-            stream.write(client['write_buffer'])
-            client['write_buffer'] = ''
+    def _connected(self):
+        logger.info('connected')
+        self.status = RelayAgent.CONNECTED
+        self.stream.set_close_callback(self._closed)
+        self.stream.read_until_close(self._read_final_callback, self._streaming_read)
+        if len(self.buf_write):
+            self.stream.write(self.buf_write)
+            self.buf_write = ''
 
-    def _streaming_read(self, data, session_id):
-        client = self._clients[session_id]
-        client['read_buffer'] += data
-        if client['read_callback'] is not None:
-            client['read_callback'](client['read_buffer'])
-            client['read_buffer'] = ''
-            client['read_callback'] = None
-
-    def _closed(self, session_id):
-        del self._clients[session_id]
-
-    def read(self, session_id, callback):
-        client = self._clients[session_id]
-        if len(client['read_buffer']):
-            callback(client['read_buffer'])
-            client['read_buffer'] = ''
-            client['read_callback'] = None
-        else:
-            client['read_callback'] = callback
-
+    def _closed(self):
+        self.status = RelayAgent.CLOSED
+        if self.close_callback:
+            self.close_callback(self)
 
     def _read_final_callback(self, data):
-        logger.info(data)
+        pass
 
-    def write(self, session_id, data):
-        client = self._clients[session_id]
-        if not client['connected']:
-            client['write_buffer'] += data
+    def _streaming_read(self, data):
+        self.buf_read += data
+        if self.read_callback is not None:
+            self.read_callback(self.buf_read)
+            self.buf_read = ''
+            self.read_callback = None
+
+    def read(self, callback):
+        if len(self.buf_read):
+            callback(self.buf_read)
+            self.buf_read = ''
+            self.read_callback = None
         else:
-            client['stream'].write(data)
+            self.read_callback = callback
+
+    def write(self, data):
+        if self.status == RelayAgent.CONNECTED:
+            self.stream.write(data)
+        else:
+            self.buf_write += data
+
+    def is_usable(self):
+        return self.status != RelayAgent.CLOSED and self.status != RelayAgent.ERROR
+
+
+class RelayAgentPool(object):
+    def __init__(self):
+        self._agents = {}
+
+    def create_agent(self, host, port):
+        sid = uuid.uuid4().hex
+        agent = RelayAgent(sid, host, port)
+        self._agents[sid] = agent
+        return agent
+
+    def get_agent(self, sid):
+        if sid in self._agents:
+            return self._agents[sid]
+        else:
+            return None
 
 
 class CookieHandler(tornado.web.RequestHandler):
-
     def get(self):
         ext = self.get_argument('ext')
         path = self.get_argument('path')
         scheme = 'chrome-extension'
-        relay_user = 'haro'
-        relay_host = '192.168.77.32'
-        self.set_cookie('_relay_session_id', uuid.uuid4().hex)
+        relay_user = 'relay_user'
+        relay_host = self.request.host
+        idx = relay_host.find(':')
+        if idx != -1:
+            relay_host = relay_host[:idx]
+        self.set_cookie('auth_token', uuid.uuid4().hex) # authentication is not implemented
         return self.redirect("%s://%s/%s#%s@%s" % (scheme, ext, path, relay_user, relay_host))
 
 
 class CrossDomainHandler(tornado.web.RequestHandler):
-
     def prepare(self):
         origin = self.request.headers.get('origin', '*')
         self.set_header('Access-Control-Allow-Origin', origin)
@@ -109,64 +145,54 @@ class CrossDomainHandler(tornado.web.RequestHandler):
 
 
 class RelayProxyHandler(CrossDomainHandler):
-
     def get(self):
         host = self.get_argument('host')
         port = int(self.get_argument('port'))
-        session_id = self.get_cookie('_relay_session_id')
-        logger.info('session_id: %s', session_id)
-        agent.new_client(session_id, host, port)
-        logger.info(agent._clients)
-        self.write(session_id)
+        agent = pool.create_agent(host, port)
+        agent.connect()
+        self.write(agent.sid)
 
-        
+
 class RelayReadHandler(CrossDomainHandler):
-
-
     @tornado.web.asynchronous
     def get(self):
-        session_id = self.get_argument('sid')
-        agent.read(session_id, self._on_read)
-        self.set_status(200)
-        self.flush()
-        logger.info('start hanging GET request')
+        sid = self.get_argument('sid')
+        agent = pool.get_agent(sid)
+        if agent is None or not agent.is_usable():
+            self.send_error(410)
+            return
+        agent.read(self._on_read)
 
     def _on_read(self, data):
-        logger.info('%d bytes read', len(data))
         self.write(base64_to_websafe(base64.b64encode(data)))
-        logger.info(base64_to_websafe(base64.b64encode(data)))
-        self.flush()
         self.finish()
 
-class RelayWriteHandler(CrossDomainHandler):
 
+class RelayWriteHandler(CrossDomainHandler):
     def get(self):
-        logger.info('write request received')
-        session_id = self.get_argument('sid')
+        sid = self.get_argument('sid')
+        agent = pool.get_agent(sid)
+        if agent is None or not agent.is_usable():
+            self.send_error(410)
+            return
         data = base64.b64decode(websafe_to_base64(self.get_argument('data')))
-        logger.info('%d bytes written', len(data))
-        agent.write(session_id, data)
+        agent.write(data)
         self.write('OK')
 
-        
 
-agent = RelayAgent()
+pool = RelayAgentPool()
 
 cookie_app = tornado.web.Application([
     (r"/cookie", CookieHandler),
-], debug=True)
+])
 
 relay_app = tornado.web.Application([
     (r"/proxy", RelayProxyHandler),
     (r"/read", RelayReadHandler),
     (r"/write", RelayWriteHandler),
-], debug=True)
-
+])
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        relay_app.listen(8023)
-    else:
-        cookie_app.listen(8022)
+    relay_app.listen(8023)
+    cookie_app.listen(8022)
     tornado.ioloop.IOLoop.instance().start()
-
